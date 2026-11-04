@@ -1,0 +1,88 @@
+"""Train the Inner Echo emotion model on GoEmotions.
+
+Run:  python train.py
+"""
+import re
+
+import joblib
+import pandas as pd
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, classification_report
+from sklearn.pipeline import FeatureUnion, Pipeline
+
+import config
+
+
+def normalize_text(text: str) -> str:
+    text = text.lower()
+    text = re.sub(r"https?://\S+|www\.\S+", " ", text)
+    text = re.sub(r"\b\d{3,}(?:\s*[-.]?\s*)?\b", " ", text)
+    text = re.sub(r"\[[A-Z][A-Z_]*\]", " ", text)
+    text = re.sub(r"[^\w'!?.,;:()$%\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def load_split(name: str) -> pd.DataFrame:
+    """Read one GoEmotions .tsv file and return columns: text, mood."""
+    path = config.DATA_DIR / f"{name}.tsv"
+    if not path.exists():
+        raise FileNotFoundError(f"{path} not found. Copy train.tsv, dev.tsv and test.tsv into the data folder.")
+
+    # columns: text <tab> label ids (like "3,27") <tab> comment id
+    df = pd.read_csv(path, sep="\t", header=None, names=["text", "ids", "comment_id"])
+
+    # a sentence can have several labels, so we keep the first one
+    df["first_id"] = df["ids"].astype(str).str.split(",").str[0]
+    df = df[df["first_id"].str.isdigit()]                 # drop any bad rows
+    df["first_id"] = df["first_id"].astype(int)
+    df = df[df["first_id"] < len(config.GO_EMOTIONS)]
+
+    # id -> original label -> one of our 7 moods
+    df["label"] = df["first_id"].map(lambda i: config.GO_EMOTIONS[i])
+    df["mood"] = df["label"].map(config.LABEL_TO_GROUP)
+    df["text"] = df["text"].astype(str).map(normalize_text)
+    df = df[df["text"] != ""]
+    return df[["text", "mood"]]
+
+
+def main():
+    train = load_split("train")
+    dev = load_split("dev")
+    test = load_split("test")
+    print(f"train: {len(train)}   dev: {len(dev)}   test: {len(test)}")
+    print("\nMood counts in train:")
+    print(train["mood"].value_counts())
+
+    features = FeatureUnion([
+        ("word_tfidf", TfidfVectorizer(
+            ngram_range=(1, 2), sublinear_tf=True, min_df=2,
+            max_features=50_000, strip_accents="unicode",
+        )),
+        ("char_tfidf", TfidfVectorizer(
+            analyzer="char_wb", ngram_range=(3, 5), sublinear_tf=True,
+            min_df=2, max_features=25_000,
+        )),
+    ])
+    model = Pipeline([
+        ("features", features),
+        # "balanced" stops the huge neutral group from drowning out the small moods
+        ("clf", LogisticRegression(max_iter=500, C=2.0, class_weight="balanced", random_state=42)),
+    ])
+
+    print("\nTraining... (can take a minute)")
+    model.fit(train["text"], train["mood"])
+
+    dev_pred = model.predict(dev["text"])
+    print(f"\nDev accuracy: {accuracy_score(dev['mood'], dev_pred):.3f}")
+
+    test_pred = model.predict(test["text"])
+    print(f"Test accuracy: {accuracy_score(test['mood'], test_pred):.3f}\n")
+    print(classification_report(test["mood"], test_pred))
+
+    joblib.dump(model, config.MODEL_PATH)
+    print(f"Saved model to {config.MODEL_PATH.name}")
+
+
+if __name__ == "__main__":
+    main()
